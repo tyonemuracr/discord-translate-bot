@@ -84,13 +84,11 @@ client.on("messageCreate", async (message) => {
 
       if (!ja || !en || ja === en) return;
 
-      const webhook = await getWebhookInChannel(message.channel);
-
-      await webhook.send({
-        content: `ja: ${ja}\nen: ${en}`,
-        username: `from: ${message.member.displayName}`,
-        avatarURL: message.author.displayAvatarURL({ dynamic: true }),
-      });
+    await safeWebhookSend(message.channel, {
+      content: `ja: ${ja}\nen: ${en}`,
+      username: `from: ${message.member.displayName}`,
+      avatarURL: message.author.displayAvatarURL({ dynamic: true }),
+    });
     } catch (e) {
       console.error(e);
     }
@@ -121,3 +119,27 @@ async function getWebhookInChannel(channel) {
   cacheWebhooks.set(channel.id, webhook);
   return webhook;
 }
+
+async function safeWebhookSend(channel, payload) {
+  try {
+    const webhook = await getWebhookInChannel(channel);
+    return await webhook.send(payload);
+  } catch (e) {
+    // Unknown Webhook / 404 のときは作り直して再送
+    if (e?.code === 10015 || e?.httpStatus === 404 || e?.status === 404) {
+      cacheWebhooks.delete(channel.id);
+
+      // 念のため古いWebhook掃除
+      try {
+        const webhooks = await channel.fetchWebhooks();
+        const ours = webhooks.find((w) => w.name === "Translate" && w.token);
+        if (ours) await ours.delete().catch(() => {});
+      } catch (_) {}
+
+      const webhook = await getWebhookInChannel(channel);
+      return await webhook.send(payload);
+    }
+    throw e;
+  }
+}
+
