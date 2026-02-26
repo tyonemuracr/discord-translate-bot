@@ -1,3 +1,13 @@
+const http = require("http");
+
+http.createServer((req, res) => {
+  if (req.url === "/healthz") {
+    res.statusCode = 200;
+    return res.end("ok");
+  }
+  res.statusCode = 200;
+  res.end("ok");
+}).listen(process.env.PORT || 3000);
 // server.js (discord.js v13 / Render & Railway 対応・コピペ版)
 
 const Discord = require("discord.js");
@@ -180,3 +190,4 @@ async function safeWebhookSend(channel, payload) {
     throw e;
   }
 }
+
