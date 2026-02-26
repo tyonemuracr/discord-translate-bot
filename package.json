@@ -1,7 +1,7 @@
 {
   "name": "glitch-hello-node",
   "version": "3.0.1",
-  "description": "A simple Node app built on fastify, instantly up and running. Built to be remixed on Glitch.com.",
+  "description": "Discord translate bot",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,8 +12,8 @@
     "querystring": "^0.2.1",
     "weather-js": "^2.0.0",
     "body-parser": "^1.20.2",
-    "moment": "^2.28.x",
-    "node-fetch": "^2.2.x",
+    "moment": "^2.29.4",
+    "node-fetch": "^2.2.4",
     "google-translate-api-x": "^10.6.8",
     "request": "^2.88.2",
     "meta-fetcher": "^3.1.1"
@@ -21,12 +21,5 @@
   "engines": {
     "node": "16.x"
   },
-  "repository": {
-    "url": "https://glitch.com/edit/#!/glitch-hello-node"
-  },
-  "license": "MIT",
-  "keywords": [
-    "node",
-    "glitch"
-  ]
+  "license": "MIT"
 }
