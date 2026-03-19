@@ -206,15 +206,35 @@ client.on("messageCreate", async (message) => {
 });
 
 // ================= LOGIN =================
+console.log("BOT START: login section reached");
+
 if (!process.env.DISCORD_BOT_TOKEN) {
   console.log("DISCORD_BOT_TOKEN が設定されていません");
   process.exit(1);
 }
 
+console.log(
+  "TOKEN CHECK:",
+  typeof process.env.DISCORD_BOT_TOKEN,
+  process.env.DISCORD_BOT_TOKEN.length
+);
+
+client.on("debug", (msg) => {
+  if (
+    msg.includes("Preparing to connect") ||
+    msg.includes("Connecting to gateway") ||
+    msg.includes("Identifying")
+  ) {
+    console.log("DEBUG:", msg);
+  }
+});
+
+console.log("Calling client.login(...)");
+
 client
   .login(process.env.DISCORD_BOT_TOKEN)
   .then(() => {
-    console.log("Discord login request sent");
+    console.log("client.login resolved");
   })
   .catch((err) => {
     console.error("Discord login failed:", err);
