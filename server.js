@@ -239,3 +239,15 @@ client
   .catch((err) => {
     console.error("Discord login failed:", err);
   });
+
+client.on("debug", (msg) => {
+  console.log("DEBUG FULL:", msg);
+});
+
+client.on("warn", (msg) => {
+  console.log("WARN:", msg);
+});
+
+client.on("rateLimit", (info) => {
+  console.log("RATE LIMIT:", info);
+});
