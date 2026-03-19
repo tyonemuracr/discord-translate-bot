@@ -2,7 +2,7 @@
 // - /healthz でOK返す（UptimeRobot用）
 // - settings.json でマルチサーバー対応
 // - Webhook Unknown Webhook(404/10015) 自動復旧
-// - 例外をログに出して落ちにくくする
+// - Discordログイン失敗理由をログに出す
 
 const http = require("http");
 const fs = require("fs");
@@ -35,7 +35,6 @@ function ensureGuild(gid) {
 }
 
 function saveSettings() {
-  // 壊れにくい保存（tmp→rename）
   const tmp = "./settings.tmp.json";
   fs.writeFileSync(tmp, JSON.stringify(settings, null, 2));
   fs.renameSync(tmp, "./settings.json");
@@ -53,12 +52,25 @@ const client = new Client({
 const prefix = "v!";
 const cacheWebhooks = new Map();
 
-// 落ちた原因が分かるようにする（重要）
+// ================== ERROR LOG ==================
 process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:", reason);
 });
+
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT EXCEPTION:", err);
+});
+
+client.on("error", (err) => {
+  console.error("CLIENT ERROR:", err);
+});
+
+client.on("shardError", (err) => {
+  console.error("SHARD ERROR:", err);
+});
+
+client.on("disconnect", (event) => {
+  console.error("DISCONNECTED:", event);
 });
 
 // ================= READY =================
@@ -71,7 +83,6 @@ client.on("ready", async () => {
 async function getValidWebhook(channel) {
   let wh = cacheWebhooks.get(channel.id);
 
-  // キャッシュがあるなら生存確認
   if (wh) {
     try {
       await wh.fetch();
@@ -100,17 +111,14 @@ async function safeWebhookSend(channel, payload) {
     const webhook = await getValidWebhook(channel);
     return await webhook.send(payload);
   } catch (e) {
-    // 直せない系は再作成ループに入らない
     if (e?.code === 50013 || e?.code === 50001 || e?.code === 10003) {
       console.error("Webhook send failed (no perm/access/channel):", e?.code);
       return null;
     }
 
-    // Unknown Webhook / 404 は作り直して再送
     if (e?.code === 10015 || e?.status === 404 || e?.httpStatus === 404) {
       cacheWebhooks.delete(channel.id);
 
-      // 念のため古いWebhook掃除（失敗しても無視）
       try {
         const webhooks = await channel.fetchWebhooks();
         const ours = webhooks.find((w) => w.name === "Translate" && w.token);
@@ -178,7 +186,6 @@ client.on("messageCreate", async (message) => {
       const base =
         "https://script.google.com/macros/s/AKfycbx2zxXArFJuPDctM7zrFEz73kVI6Y8JUcpr_GkxnyZeJT4c4mx8rSTSL-dqD4x7fEed/exec";
 
-      // 並列で翻訳（速い）
       const [ja, en] = await Promise.all([
         fetch(`${base}?text=${text}&source=&target=ja`).then((r) => r.text()),
         fetch(`${base}?text=${text}&source=&target=en`).then((r) => r.text()),
@@ -201,7 +208,14 @@ client.on("messageCreate", async (message) => {
 // ================= LOGIN =================
 if (!process.env.DISCORD_BOT_TOKEN) {
   console.log("DISCORD_BOT_TOKEN が設定されていません");
-  process.exit(0);
+  process.exit(1);
 }
 
-client.login(process.env.DISCORD_BOT_TOKEN);
+client
+  .login(process.env.DISCORD_BOT_TOKEN)
+  .then(() => {
+    console.log("Discord login request sent");
+  })
+  .catch((err) => {
+    console.error("Discord login failed:", err);
+  });
