@@ -1,15 +1,18 @@
-// server.js (discord.js v13) - Render Free 安定版 (ja + en)
-// - /healthz でOK返す（UptimeRobot用）
-// - settings.json でマルチサーバー対応
-// - Webhook Unknown Webhook(404/10015) 自動復旧
-// - Discordログイン失敗理由をログに出す
+// server.js (discord.js v13) - 安定版
+// - /healthz 対応
+// - マルチサーバー対応
+// - Webhook 404 自動復旧
+// - Webhook 429 時は通常メッセージ送信にフォールバック
+// - Discordログイン状況をログ出力
 
 const http = require("http");
 const fs = require("fs");
 const fetch = require("node-fetch");
 const { Client, Intents } = require("discord.js");
 
-// ================== KEEP ALIVE (Render/Railway用) ==================
+console.log("SERVER.JS LOADED");
+
+// ================== KEEP ALIVE ==================
 http
   .createServer((req, res) => {
     if (req.url === "/healthz") {
@@ -21,7 +24,7 @@ http
   })
   .listen(process.env.PORT || 3000);
 
-// ================== SETTINGS LOAD (マルチサーバー) ==================
+// ================== SETTINGS LOAD ==================
 let settings = {};
 try {
   settings = require("./settings.json");
@@ -52,7 +55,7 @@ const client = new Client({
 const prefix = "v!";
 const cacheWebhooks = new Map();
 
-// ================== ERROR LOG ==================
+// ================== DEBUG / ERROR LOG ==================
 process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:", reason);
 });
@@ -73,25 +76,38 @@ client.on("disconnect", (event) => {
   console.error("DISCONNECTED:", event);
 });
 
-// ================= READY =================
+client.on("warn", (msg) => {
+  console.log("WARN:", msg);
+});
+
+client.on("rateLimit", (info) => {
+  console.log("RATE LIMIT:", info);
+});
+
+client.on("debug", (msg) => {
+  if (
+    msg.includes("Preparing to connect") ||
+    msg.includes("Connecting to gateway") ||
+    msg.includes("Identifying") ||
+    msg.includes("READY") ||
+    msg.includes("RESUME") ||
+    msg.includes("Fetched Gateway Information") ||
+    msg.includes("Hit a 429")
+  ) {
+    console.log("DEBUG FULL:", msg);
+  }
+});
+
+// ================== READY ==================
 client.on("ready", async () => {
   console.log(`${client.user.tag} にログインしました`);
   client.user.setPresence({ status: "online" });
 });
 
-// ================= WEBHOOK HELPERS =================
+// ================== WEBHOOK HELPERS ==================
 async function getValidWebhook(channel) {
   let wh = cacheWebhooks.get(channel.id);
-
-  if (wh) {
-    try {
-      await wh.fetch();
-      return wh;
-    } catch (_) {
-      cacheWebhooks.delete(channel.id);
-      wh = null;
-    }
-  }
+  if (wh) return wh;
 
   const webhooks = await channel.fetchWebhooks();
   let webhook = webhooks.find((w) => w.token);
@@ -106,17 +122,35 @@ async function getValidWebhook(channel) {
   return webhook;
 }
 
+async function fallbackNormalSend(channel, payload) {
+  try {
+    return await channel.send(payload.content);
+  } catch (err) {
+    console.error("Fallback normal send failed:", err);
+    return null;
+  }
+}
+
 async function safeWebhookSend(channel, payload) {
   try {
     const webhook = await getValidWebhook(channel);
     return await webhook.send(payload);
   } catch (e) {
+    // 権限 / アクセス / チャンネル消滅
     if (e?.code === 50013 || e?.code === 50001 || e?.code === 10003) {
       console.error("Webhook send failed (no perm/access/channel):", e?.code);
-      return null;
+      return fallbackNormalSend(channel, payload);
     }
 
+    // Webhook API のレート制限
+    if (e?.status === 429 || e?.httpStatus === 429) {
+      console.error("Webhook route rate-limited. Fallback to normal send.");
+      return fallbackNormalSend(channel, payload);
+    }
+
+    // Unknown Webhook / 404
     if (e?.code === 10015 || e?.status === 404 || e?.httpStatus === 404) {
+      console.error("Unknown Webhook. Recreating...");
       cacheWebhooks.delete(channel.id);
 
       try {
@@ -125,16 +159,24 @@ async function safeWebhookSend(channel, payload) {
         if (ours) await ours.delete().catch(() => {});
       } catch (_) {}
 
-      const webhook = await getValidWebhook(channel);
-      return await webhook.send(payload);
+      try {
+        const webhook = await getValidWebhook(channel);
+        return await webhook.send(payload);
+      } catch (err) {
+        console.error("Webhook recreate failed. Fallback to normal send:", err);
+        return fallbackNormalSend(channel, payload);
+      }
     }
 
-    throw e;
+    console.error("safeWebhookSend error:", e);
+    return fallbackNormalSend(channel, payload);
   }
 }
 
-// ================= MESSAGE =================
+// ================== MESSAGE ==================
 client.on("messageCreate", async (message) => {
+  console.log("MESSAGE EVENT:", message.content);
+
   if (!message.guild) return;
   if (message.author.bot) return;
 
@@ -205,7 +247,7 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-// ================= LOGIN =================
+// ================== LOGIN ==================
 console.log("BOT START: login section reached");
 
 if (!process.env.DISCORD_BOT_TOKEN) {
@@ -219,16 +261,6 @@ console.log(
   process.env.DISCORD_BOT_TOKEN.length
 );
 
-client.on("debug", (msg) => {
-  if (
-    msg.includes("Preparing to connect") ||
-    msg.includes("Connecting to gateway") ||
-    msg.includes("Identifying")
-  ) {
-    console.log("DEBUG:", msg);
-  }
-});
-
 console.log("Calling client.login(...)");
 
 client
@@ -239,15 +271,3 @@ client
   .catch((err) => {
     console.error("Discord login failed:", err);
   });
-
-client.on("debug", (msg) => {
-  console.log("DEBUG FULL:", msg);
-});
-
-client.on("warn", (msg) => {
-  console.log("WARN:", msg);
-});
-
-client.on("rateLimit", (info) => {
-  console.log("RATE LIMIT:", info);
-});
