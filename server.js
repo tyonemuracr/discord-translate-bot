@@ -1,9 +1,10 @@
-// server.js (discord.js v13) - 安定版
+// server.js (discord.js v13) - 安定運用版
 // - /healthz 対応
+// - Koyeb / Render / Railway 向け
 // - マルチサーバー対応
-// - Webhook 404 自動復旧
-// - Webhook 429 時は通常メッセージ送信にフォールバック
-// - Discordログイン状況をログ出力
+// - webhook はキャッシュして使い回す
+// - webhook 429 / 404 時は通常送信にフォールバック
+// - 再デプロイや一時的なAPI制限でも止まりにくい
 
 const http = require("http");
 const fs = require("fs");
@@ -53,7 +54,9 @@ const client = new Client({
 });
 
 const prefix = "v!";
-const cacheWebhooks = new Map();
+
+// channel.id -> webhook object
+const webhookCache = new Map();
 
 // ================== DEBUG / ERROR LOG ==================
 process.on("unhandledRejection", (reason) => {
@@ -89,8 +92,8 @@ client.on("debug", (msg) => {
     msg.includes("Preparing to connect") ||
     msg.includes("Connecting to gateway") ||
     msg.includes("Identifying") ||
-    msg.includes("READY") ||
-    msg.includes("RESUME") ||
+    msg.includes("[READY]") ||
+    msg.includes("[RESUME]") ||
     msg.includes("Fetched Gateway Information") ||
     msg.includes("Hit a 429")
   ) {
@@ -105,12 +108,12 @@ client.on("ready", async () => {
 });
 
 // ================== WEBHOOK HELPERS ==================
-async function getValidWebhook(channel) {
-  let wh = cacheWebhooks.get(channel.id);
-  if (wh) return wh;
+async function getCachedWebhook(channel) {
+  const cached = webhookCache.get(channel.id);
+  if (cached) return cached;
 
   const webhooks = await channel.fetchWebhooks();
-  let webhook = webhooks.find((w) => w.token);
+  let webhook = webhooks.find((w) => w.token && w.name === "Translate");
 
   if (!webhook) {
     webhook = await channel.createWebhook("Translate", {
@@ -118,7 +121,7 @@ async function getValidWebhook(channel) {
     });
   }
 
-  cacheWebhooks.set(channel.id, webhook);
+  webhookCache.set(channel.id, webhook);
   return webhook;
 }
 
@@ -131,18 +134,12 @@ async function fallbackNormalSend(channel, payload) {
   }
 }
 
-async function safeWebhookSend(channel, payload) {
+async function safeSend(channel, payload) {
   try {
-    const webhook = await getValidWebhook(channel);
+    const webhook = await getCachedWebhook(channel);
     return await webhook.send(payload);
   } catch (e) {
-    // 権限 / アクセス / チャンネル消滅
-    if (e?.code === 50013 || e?.code === 50001 || e?.code === 10003) {
-      console.error("Webhook send failed (no perm/access/channel):", e?.code);
-      return fallbackNormalSend(channel, payload);
-    }
-
-    // Webhook API のレート制限
+    // Webhook レート制限
     if (e?.status === 429 || e?.httpStatus === 429) {
       console.error("Webhook route rate-limited. Fallback to normal send.");
       return fallbackNormalSend(channel, payload);
@@ -151,7 +148,7 @@ async function safeWebhookSend(channel, payload) {
     // Unknown Webhook / 404
     if (e?.code === 10015 || e?.status === 404 || e?.httpStatus === 404) {
       console.error("Unknown Webhook. Recreating...");
-      cacheWebhooks.delete(channel.id);
+      webhookCache.delete(channel.id);
 
       try {
         const webhooks = await channel.fetchWebhooks();
@@ -160,7 +157,7 @@ async function safeWebhookSend(channel, payload) {
       } catch (_) {}
 
       try {
-        const webhook = await getValidWebhook(channel);
+        const webhook = await getCachedWebhook(channel);
         return await webhook.send(payload);
       } catch (err) {
         console.error("Webhook recreate failed. Fallback to normal send:", err);
@@ -168,7 +165,13 @@ async function safeWebhookSend(channel, payload) {
       }
     }
 
-    console.error("safeWebhookSend error:", e);
+    // 権限系 / アクセス系
+    if (e?.code === 50013 || e?.code === 50001 || e?.code === 10003) {
+      console.error("Webhook send failed (no perm/access/channel):", e?.code);
+      return fallbackNormalSend(channel, payload);
+    }
+
+    console.error("safeSend error:", e);
     return fallbackNormalSend(channel, payload);
   }
 }
@@ -197,13 +200,20 @@ client.on("messageCreate", async (message) => {
           `すでにこのサーバーで有効です（<#${settings.guilds[gid].msgch}>）`
         );
       }
-      settings.guilds[gid] = { trst: 1, msgch: message.channel.id };
+
+      settings.guilds[gid] = {
+        trst: 1,
+        msgch: message.channel.id,
+      };
       saveSettings();
       return message.reply("✅ 自動翻訳を開始しました（ja / en）");
     }
 
     if (command === "stop") {
-      settings.guilds[gid] = { trst: 0, msgch: 0 };
+      settings.guilds[gid] = {
+        trst: 0,
+        msgch: 0,
+      };
       saveSettings();
       return message.reply("🛑 自動翻訳を停止しました");
     }
@@ -236,7 +246,7 @@ client.on("messageCreate", async (message) => {
       if (!ja || !en) return;
       if (ja === en) return;
 
-      await safeWebhookSend(message.channel, {
+      await safeSend(message.channel, {
         content: `ja: ${ja}\nen: ${en}`,
         username: `from: ${message.member?.displayName || message.author.username}`,
         avatarURL: message.author.displayAvatarURL({ dynamic: true }),
