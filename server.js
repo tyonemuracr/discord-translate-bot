@@ -1,15 +1,16 @@
 // server.js
 // discord.js v13
-// 安定重視版
-// - Webhook未使用（webhook 429を回避）
+// 表示重視 + 安定版（調整版）
+// - 送信者名/アイコンは webhook で再現
+// - 本文に「from: 名前」は入れない
 // - /healthz 対応
 // - マルチサーバー対応
-// - 翻訳タイムアウト
+// - webhook キャッシュ
+// - webhook 429/404 時は通常送信にフォールバック
+// - 翻訳タイムアウトを長めに調整
 // - 古い翻訳の破棄
 // - stop/start 後の古いジョブ無効化
 // - チャンネルごとの直列キュー
-// - 送信間隔の最小ウェイト
-// - 重複処理防止
 
 const http = require("http");
 const fs = require("fs");
@@ -24,16 +25,16 @@ const prefix = "v!";
 const GAS_BASE_URL =
   "https://script.google.com/macros/s/AKfycbx2zxXArFJuPDctM7zrFEz73kVI6Y8JUcpr_GkxnyZeJT4c4mx8rSTSL-dqD4x7fEed/exec";
 
-// 遅すぎる翻訳は捨てる
-const GAS_TIMEOUT_MS = 8000;
+// 翻訳API待機時間（長め）
+const GAS_TIMEOUT_MS = 15000;
 
-// メッセージ受信からこれ以上経った翻訳結果は捨てる
-const MAX_TRANSLATION_AGE_MS = 15000;
+// 受信からこれ以上経った翻訳結果は捨てる
+const MAX_TRANSLATION_AGE_MS = 30000;
 
-// 同じチャンネルでの送信間隔を最低これだけ空ける
+// 送信間隔
 const MIN_SEND_INTERVAL_MS = 1200;
 
-// processedMessageIds の保持時間
+// 処理済みID保持時間
 const PROCESSED_TTL_MS = 10 * 60 * 1000;
 
 // ================== KEEP ALIVE ==================
@@ -74,22 +75,16 @@ const client = new Client({
   intents: [
     Intents.FLAGS.GUILDS,
     Intents.FLAGS.GUILD_MESSAGES,
+    Intents.FLAGS.GUILD_WEBHOOKS,
   ],
 });
 
 // ================== RUNTIME STATE ==================
-// サーバーごとの翻訳世代
-// start/stop のたびに増やして、古い非同期処理を無効化する
 const guildGeneration = new Map();
-
-// チャンネルごとの送信キュー
 const channelQueues = new Map();
-
-// チャンネルごとの最終送信時刻
 const channelLastSendAt = new Map();
-
-// 重複翻訳防止
 const processedMessageIds = new Map();
+const webhookCache = new Map();
 
 function getGuildGeneration(gid) {
   if (!guildGeneration.has(gid)) guildGeneration.set(gid, 1);
@@ -201,19 +196,15 @@ function truncate(text, max) {
   return text.length > max ? text.slice(0, max - 1) + "…" : text;
 }
 
-function buildTranslationContent(displayName, ja, en) {
-  const header = `from: ${displayName}`;
-  const bodyJa = `ja: ${truncate(ja, 850)}`;
-  const bodyEn = `en: ${truncate(en, 850)}`;
-  let content = `${header}\n${bodyJa}\n${bodyEn}`;
-
+function buildTranslationContent(ja, en) {
+  let content = `ja: ${truncate(ja, 950)}\nen: ${truncate(en, 950)}`;
   if (content.length > 1900) {
     content = truncate(content, 1900);
   }
   return content;
 }
 
-async function sendWithSpacing(channel, content) {
+async function sendWithSpacing(channel, sendFn) {
   const now = Date.now();
   const last = channelLastSendAt.get(channel.id) || 0;
   const wait = Math.max(0, MIN_SEND_INTERVAL_MS - (now - last));
@@ -222,13 +213,9 @@ async function sendWithSpacing(channel, content) {
     await sleep(wait);
   }
 
-  const sent = await channel.send({
-    content,
-    allowedMentions: { parse: [] },
-  });
-
+  const result = await sendFn();
   channelLastSendAt.set(channel.id, Date.now());
-  return sent;
+  return result;
 }
 
 function enqueueChannelJob(channelId, job) {
@@ -249,7 +236,77 @@ function shouldDropByAge(messageCreatedAt) {
   return Date.now() - messageCreatedAt > MAX_TRANSLATION_AGE_MS;
 }
 
-// ================== COMMANDS / MESSAGES ==================
+// ================== WEBHOOK ==================
+async function getCachedWebhook(channel) {
+  const cached = webhookCache.get(channel.id);
+  if (cached) return cached;
+
+  const webhooks = await channel.fetchWebhooks();
+  let webhook = webhooks.find((w) => w.token && w.name === "Translate");
+
+  if (!webhook) {
+    webhook = await channel.createWebhook("Translate", {
+      avatar: client.user.displayAvatarURL(),
+    });
+  }
+
+  webhookCache.set(channel.id, webhook);
+  return webhook;
+}
+
+async function sendFallbackMessage(channel, content) {
+  return sendWithSpacing(channel, async () => {
+    return channel.send({
+      content,
+      allowedMentions: { parse: [] },
+    });
+  });
+}
+
+async function safeSendTranslatedMessage(channel, payload) {
+  try {
+    return await sendWithSpacing(channel, async () => {
+      const webhook = await getCachedWebhook(channel);
+      return webhook.send(payload);
+    });
+  } catch (e) {
+    if (e?.status === 429 || e?.httpStatus === 429) {
+      console.error("Webhook 429. Fallback to normal send.");
+      return sendFallbackMessage(channel, payload.content);
+    }
+
+    if (e?.code === 10015 || e?.status === 404 || e?.httpStatus === 404) {
+      console.error("Unknown Webhook. Recreating...");
+      webhookCache.delete(channel.id);
+
+      try {
+        const webhooks = await channel.fetchWebhooks();
+        const ours = webhooks.find((w) => w.name === "Translate" && w.token);
+        if (ours) await ours.delete().catch(() => {});
+      } catch (_) {}
+
+      try {
+        return await sendWithSpacing(channel, async () => {
+          const webhook = await getCachedWebhook(channel);
+          return webhook.send(payload);
+        });
+      } catch (err) {
+        console.error("Webhook recreate failed. Fallback to normal send:", err);
+        return sendFallbackMessage(channel, payload.content);
+      }
+    }
+
+    if (e?.code === 50013 || e?.code === 50001 || e?.code === 10003) {
+      console.error("Webhook permission/access/channel error:", e?.code);
+      return sendFallbackMessage(channel, payload.content);
+    }
+
+    console.error("safeSendTranslatedMessage error:", e);
+    return sendFallbackMessage(channel, payload.content);
+  }
+}
+
+// ================== MESSAGE ==================
 client.on("messageCreate", async (message) => {
   console.log("MESSAGE EVENT:", message.content);
 
@@ -297,9 +354,7 @@ client.on("messageCreate", async (message) => {
     if (command === "status") {
       const state = settings.guilds[gid];
       return message.reply(
-        state.trst === 1
-          ? `ON: <#${state.msgch}>`
-          : "OFF"
+        state.trst === 1 ? `ON: <#${state.msgch}>` : "OFF"
       );
     }
 
@@ -321,9 +376,9 @@ client.on("messageCreate", async (message) => {
   const messageCreatedAt = message.createdTimestamp;
   const originalText = content;
   const displayName = message.member?.displayName || message.author.username;
+  const avatarURL = message.author.displayAvatarURL({ dynamic: true }) || undefined;
 
   enqueueChannelJob(message.channel.id, async () => {
-    // キュー待ち中に stop/start や時間経過が起きたら捨てる
     if (settings.guilds[gid].trst !== 1) {
       console.log("DROP: translation finished after stop");
       return;
@@ -361,7 +416,6 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // 翻訳完了後にも再チェック
     if (settings.guilds[gid].trst !== 1) {
       console.log("DROP: translation finished after stop");
       return;
@@ -392,13 +446,14 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    const translatedContent = buildTranslationContent(displayName, ja, en);
+    const translatedContent = buildTranslationContent(ja, en);
 
-    try {
-      await sendWithSpacing(message.channel, translatedContent);
-    } catch (err) {
-      console.error("SEND ERROR:", err);
-    }
+    await safeSendTranslatedMessage(message.channel, {
+      content: translatedContent,
+      username: displayName,
+      avatarURL,
+      allowedMentions: { parse: [] },
+    });
   });
 });
 
