@@ -1,10 +1,15 @@
-// server.js (discord.js v13) - 安定運用版
+// server.js
+// discord.js v13
+// 安定重視版
+// - Webhook未使用（webhook 429を回避）
 // - /healthz 対応
-// - Koyeb / Render / Railway 向け
 // - マルチサーバー対応
-// - webhook はキャッシュして使い回す
-// - webhook 429 / 404 時は通常送信にフォールバック
-// - 再デプロイや一時的なAPI制限でも止まりにくい
+// - 翻訳タイムアウト
+// - 古い翻訳の破棄
+// - stop/start 後の古いジョブ無効化
+// - チャンネルごとの直列キュー
+// - 送信間隔の最小ウェイト
+// - 重複処理防止
 
 const http = require("http");
 const fs = require("fs");
@@ -12,6 +17,24 @@ const fetch = require("node-fetch");
 const { Client, Intents } = require("discord.js");
 
 console.log("SERVER.JS LOADED");
+
+// ================== CONFIG ==================
+const prefix = "v!";
+
+const GAS_BASE_URL =
+  "https://script.google.com/macros/s/AKfycbx2zxXArFJuPDctM7zrFEz73kVI6Y8JUcpr_GkxnyZeJT4c4mx8rSTSL-dqD4x7fEed/exec";
+
+// 遅すぎる翻訳は捨てる
+const GAS_TIMEOUT_MS = 8000;
+
+// メッセージ受信からこれ以上経った翻訳結果は捨てる
+const MAX_TRANSLATION_AGE_MS = 15000;
+
+// 同じチャンネルでの送信間隔を最低これだけ空ける
+const MIN_SEND_INTERVAL_MS = 1200;
+
+// processedMessageIds の保持時間
+const PROCESSED_TTL_MS = 10 * 60 * 1000;
 
 // ================== KEEP ALIVE ==================
 http
@@ -25,7 +48,7 @@ http
   })
   .listen(process.env.PORT || 3000);
 
-// ================== SETTINGS LOAD ==================
+// ================== SETTINGS ==================
 let settings = {};
 try {
   settings = require("./settings.json");
@@ -35,7 +58,9 @@ try {
 if (!settings.guilds) settings.guilds = {};
 
 function ensureGuild(gid) {
-  if (!settings.guilds[gid]) settings.guilds[gid] = { trst: 0, msgch: 0 };
+  if (!settings.guilds[gid]) {
+    settings.guilds[gid] = { trst: 0, msgch: 0 };
+  }
 }
 
 function saveSettings() {
@@ -44,21 +69,66 @@ function saveSettings() {
   fs.renameSync(tmp, "./settings.json");
 }
 
-// ================== DISCORD CLIENT ==================
+// ================== CLIENT ==================
 const client = new Client({
   intents: [
     Intents.FLAGS.GUILDS,
     Intents.FLAGS.GUILD_MESSAGES,
-    Intents.FLAGS.GUILD_WEBHOOKS,
   ],
 });
 
-const prefix = "v!";
+// ================== RUNTIME STATE ==================
+// サーバーごとの翻訳世代
+// start/stop のたびに増やして、古い非同期処理を無効化する
+const guildGeneration = new Map();
 
-// channel.id -> webhook object
-const webhookCache = new Map();
+// チャンネルごとの送信キュー
+const channelQueues = new Map();
 
-// ================== DEBUG / ERROR LOG ==================
+// チャンネルごとの最終送信時刻
+const channelLastSendAt = new Map();
+
+// 重複翻訳防止
+const processedMessageIds = new Map();
+
+function getGuildGeneration(gid) {
+  if (!guildGeneration.has(gid)) guildGeneration.set(gid, 1);
+  return guildGeneration.get(gid);
+}
+
+function bumpGuildGeneration(gid) {
+  const next = getGuildGeneration(gid) + 1;
+  guildGeneration.set(gid, next);
+  return next;
+}
+
+function markProcessed(messageId) {
+  processedMessageIds.set(messageId, Date.now());
+}
+
+function isProcessed(messageId) {
+  const ts = processedMessageIds.get(messageId);
+  if (!ts) return false;
+
+  if (Date.now() - ts > PROCESSED_TTL_MS) {
+    processedMessageIds.delete(messageId);
+    return false;
+  }
+  return true;
+}
+
+function cleanupProcessedIds() {
+  const now = Date.now();
+  for (const [id, ts] of processedMessageIds.entries()) {
+    if (now - ts > PROCESSED_TTL_MS) {
+      processedMessageIds.delete(id);
+    }
+  }
+}
+
+setInterval(cleanupProcessedIds, 60 * 1000);
+
+// ================== LOGS ==================
 process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:", reason);
 });
@@ -97,86 +167,89 @@ client.on("debug", (msg) => {
     msg.includes("Fetched Gateway Information") ||
     msg.includes("Hit a 429")
   ) {
-    console.log("DEBUG FULL:", msg);
+    console.log("DEBUG:", msg);
   }
 });
 
 // ================== READY ==================
-client.on("ready", async () => {
+client.on("ready", () => {
   console.log(`${client.user.tag} にログインしました`);
   client.user.setPresence({ status: "online" });
 });
 
-// ================== WEBHOOK HELPERS ==================
-async function getCachedWebhook(channel) {
-  const cached = webhookCache.get(channel.id);
-  if (cached) return cached;
+// ================== HELPERS ==================
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  const webhooks = await channel.fetchWebhooks();
-  let webhook = webhooks.find((w) => w.token && w.name === "Translate");
+async function translateWithTimeout(text, target) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GAS_TIMEOUT_MS);
 
-  if (!webhook) {
-    webhook = await channel.createWebhook("Translate", {
-      avatar: client.user.displayAvatarURL(),
+  try {
+    const url =
+      `${GAS_BASE_URL}?text=${encodeURIComponent(text)}&source=&target=${encodeURIComponent(target)}`;
+    const res = await fetch(url, { signal: controller.signal });
+    return await res.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function truncate(text, max) {
+  if (!text) return "";
+  return text.length > max ? text.slice(0, max - 1) + "…" : text;
+}
+
+function buildTranslationContent(displayName, ja, en) {
+  const header = `from: ${displayName}`;
+  const bodyJa = `ja: ${truncate(ja, 850)}`;
+  const bodyEn = `en: ${truncate(en, 850)}`;
+  let content = `${header}\n${bodyJa}\n${bodyEn}`;
+
+  if (content.length > 1900) {
+    content = truncate(content, 1900);
+  }
+  return content;
+}
+
+async function sendWithSpacing(channel, content) {
+  const now = Date.now();
+  const last = channelLastSendAt.get(channel.id) || 0;
+  const wait = Math.max(0, MIN_SEND_INTERVAL_MS - (now - last));
+
+  if (wait > 0) {
+    await sleep(wait);
+  }
+
+  const sent = await channel.send({
+    content,
+    allowedMentions: { parse: [] },
+  });
+
+  channelLastSendAt.set(channel.id, Date.now());
+  return sent;
+}
+
+function enqueueChannelJob(channelId, job) {
+  const prev = channelQueues.get(channelId) || Promise.resolve();
+
+  const next = prev
+    .catch(() => {})
+    .then(job)
+    .catch((err) => {
+      console.error("QUEUE JOB ERROR:", err);
     });
-  }
 
-  webhookCache.set(channel.id, webhook);
-  return webhook;
+  channelQueues.set(channelId, next);
+  return next;
 }
 
-async function fallbackNormalSend(channel, payload) {
-  try {
-    return await channel.send(payload.content);
-  } catch (err) {
-    console.error("Fallback normal send failed:", err);
-    return null;
-  }
+function shouldDropByAge(messageCreatedAt) {
+  return Date.now() - messageCreatedAt > MAX_TRANSLATION_AGE_MS;
 }
 
-async function safeSend(channel, payload) {
-  try {
-    const webhook = await getCachedWebhook(channel);
-    return await webhook.send(payload);
-  } catch (e) {
-    // Webhook レート制限
-    if (e?.status === 429 || e?.httpStatus === 429) {
-      console.error("Webhook route rate-limited. Fallback to normal send.");
-      return fallbackNormalSend(channel, payload);
-    }
-
-    // Unknown Webhook / 404
-    if (e?.code === 10015 || e?.status === 404 || e?.httpStatus === 404) {
-      console.error("Unknown Webhook. Recreating...");
-      webhookCache.delete(channel.id);
-
-      try {
-        const webhooks = await channel.fetchWebhooks();
-        const ours = webhooks.find((w) => w.name === "Translate" && w.token);
-        if (ours) await ours.delete().catch(() => {});
-      } catch (_) {}
-
-      try {
-        const webhook = await getCachedWebhook(channel);
-        return await webhook.send(payload);
-      } catch (err) {
-        console.error("Webhook recreate failed. Fallback to normal send:", err);
-        return fallbackNormalSend(channel, payload);
-      }
-    }
-
-    // 権限系 / アクセス系
-    if (e?.code === 50013 || e?.code === 50001 || e?.code === 10003) {
-      console.error("Webhook send failed (no perm/access/channel):", e?.code);
-      return fallbackNormalSend(channel, payload);
-    }
-
-    console.error("safeSend error:", e);
-    return fallbackNormalSend(channel, payload);
-  }
-}
-
-// ================== MESSAGE ==================
+// ================== COMMANDS / MESSAGES ==================
 client.on("messageCreate", async (message) => {
   console.log("MESSAGE EVENT:", message.content);
 
@@ -189,23 +262,18 @@ client.on("messageCreate", async (message) => {
   const content = (message.content || "").trim();
   if (!content) return;
 
-  // ---------- COMMAND ----------
+  // -------- COMMAND --------
   if (content.startsWith(prefix)) {
     const args = content.slice(prefix.length).trim().split(/ +/g);
     const command = (args.shift() || "").toLowerCase();
 
     if (command === "start") {
-      if (settings.guilds[gid].trst === 1) {
-        return message.reply(
-          `すでにこのサーバーで有効です（<#${settings.guilds[gid].msgch}>）`
-        );
-      }
-
       settings.guilds[gid] = {
         trst: 1,
         msgch: message.channel.id,
       };
       saveSettings();
+      bumpGuildGeneration(gid);
       return message.reply("✅ 自動翻訳を開始しました（ja / en）");
     }
 
@@ -215,46 +283,123 @@ client.on("messageCreate", async (message) => {
         msgch: 0,
       };
       saveSettings();
+      bumpGuildGeneration(gid);
       return message.reply("🛑 自動翻訳を停止しました");
     }
 
     if (command === "help") {
       return message.channel.send(
         `**${prefix}start** 自動翻訳ON（このチャンネル）\n` +
-          `**${prefix}stop** 自動翻訳OFF\n`
+        `**${prefix}stop** 自動翻訳OFF\n`
+      );
+    }
+
+    if (command === "status") {
+      const state = settings.guilds[gid];
+      return message.reply(
+        state.trst === 1
+          ? `ON: <#${state.msgch}>`
+          : "OFF"
       );
     }
 
     return;
   }
 
-  // ---------- AUTO TRANSLATE ----------
+  // -------- AUTO TRANSLATE --------
   if (
-    settings.guilds[gid].trst === 1 &&
-    message.channel.id === settings.guilds[gid].msgch
+    settings.guilds[gid].trst !== 1 ||
+    message.channel.id !== settings.guilds[gid].msgch
   ) {
-    try {
-      const text = encodeURIComponent(content);
-      const base =
-        "https://script.google.com/macros/s/AKfycbx2zxXArFJuPDctM7zrFEz73kVI6Y8JUcpr_GkxnyZeJT4c4mx8rSTSL-dqD4x7fEed/exec";
-
-      const [ja, en] = await Promise.all([
-        fetch(`${base}?text=${text}&source=&target=ja`).then((r) => r.text()),
-        fetch(`${base}?text=${text}&source=&target=en`).then((r) => r.text()),
-      ]);
-
-      if (!ja || !en) return;
-      if (ja === en) return;
-
-      await safeSend(message.channel, {
-        content: `ja: ${ja}\nen: ${en}`,
-        username: `from: ${message.member?.displayName || message.author.username}`,
-        avatarURL: message.author.displayAvatarURL({ dynamic: true }),
-      });
-    } catch (e) {
-      console.error("translate/send error:", e);
-    }
+    return;
   }
+
+  if (isProcessed(message.id)) return;
+  markProcessed(message.id);
+
+  const generationAtReceive = getGuildGeneration(gid);
+  const messageCreatedAt = message.createdTimestamp;
+  const originalText = content;
+  const displayName = message.member?.displayName || message.author.username;
+
+  enqueueChannelJob(message.channel.id, async () => {
+    // キュー待ち中に stop/start や時間経過が起きたら捨てる
+    if (settings.guilds[gid].trst !== 1) {
+      console.log("DROP: translation finished after stop");
+      return;
+    }
+
+    if (message.channel.id !== settings.guilds[gid].msgch) {
+      console.log("DROP: target channel changed");
+      return;
+    }
+
+    if (generationAtReceive !== getGuildGeneration(gid)) {
+      console.log("DROP: stale generation before translate");
+      return;
+    }
+
+    if (shouldDropByAge(messageCreatedAt)) {
+      console.log("DROP: stale age before translate");
+      return;
+    }
+
+    let ja;
+    let en;
+
+    try {
+      [ja, en] = await Promise.all([
+        translateWithTimeout(originalText, "ja"),
+        translateWithTimeout(originalText, "en"),
+      ]);
+    } catch (err) {
+      if (err.name === "AbortError") {
+        console.log("DROP: translation timeout");
+        return;
+      }
+      console.error("TRANSLATE ERROR:", err);
+      return;
+    }
+
+    // 翻訳完了後にも再チェック
+    if (settings.guilds[gid].trst !== 1) {
+      console.log("DROP: translation finished after stop");
+      return;
+    }
+
+    if (message.channel.id !== settings.guilds[gid].msgch) {
+      console.log("DROP: target channel changed after translate");
+      return;
+    }
+
+    if (generationAtReceive !== getGuildGeneration(gid)) {
+      console.log("DROP: stale generation after translate");
+      return;
+    }
+
+    if (shouldDropByAge(messageCreatedAt)) {
+      console.log("DROP: stale age after translate");
+      return;
+    }
+
+    if (!ja || !en) {
+      console.log("DROP: empty translation");
+      return;
+    }
+
+    if (ja === en) {
+      console.log("DROP: same translation");
+      return;
+    }
+
+    const translatedContent = buildTranslationContent(displayName, ja, en);
+
+    try {
+      await sendWithSpacing(message.channel, translatedContent);
+    } catch (err) {
+      console.error("SEND ERROR:", err);
+    }
+  });
 });
 
 // ================== LOGIN ==================
